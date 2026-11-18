@@ -208,8 +208,9 @@ def generate(
 
     def callback(pipe, step, timestep, callback_kwargs):
         if on_progress:
-            # img2img/inpaint run fewer steps than asked for (steps * strength).
-            total = len(getattr(getattr(pipe, "scheduler", None), "timesteps", ())) or steps
+            # img2img/inpaint run fewer steps than asked for (steps * strength);
+            # diffusers sets _num_timesteps to the number actually run.
+            total = getattr(pipe, "_num_timesteps", None) or steps
             on_progress(step, total)
         return callback_kwargs
 
@@ -365,7 +366,7 @@ def settings_text(
     lines = [
         f"Prompt: {one_line(prompt)}",
         f"Negative prompt: {value('negative_prompt', one_line(negative_prompt))}",
-        f"Pipeline: {pipeline_name}",
+        f"Mode: {pipeline_name}",
         f"Model: {version}" + (f" ({', '.join(model_ids)})" if model_ids else ""),
         f"Steps: {steps}",
         f"Guidance scale: {value('guidance_scale', guidance_scale)}",

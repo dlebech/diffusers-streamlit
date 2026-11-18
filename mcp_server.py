@@ -78,13 +78,16 @@ def _check_size(width, height):
             )
 
 
-def _check_input_size(image, version):
-    """The output has the input's size (rounded down to a multiple of 16 for the newer Models)."""
+def _check_input_size(image, version, check_max=True):
+    """The output has the input's size (rounded down to a multiple of 16 for the newer Models).
+
+    check_max=False keeps only the minimum check (SDXL inpaint always outputs 1024px).
+    """
     width, height = image.size
     if version not in gen.SDXL_VERSIONS:
         width, height = width // 16 * 16, height // 16 * 16
     for name, value in (("width", width), ("height", height)):
-        if not MIN_SIZE <= value <= MAX_SIZE:
+        if value < MIN_SIZE or (check_max and value > MAX_SIZE):
             raise ToolError(
                 f"The input image is {image.width}x{image.height}, so the output {name} would be {value}: "
                 f"it must be between {MIN_SIZE} and {MAX_SIZE}. Resize the image first."
@@ -134,32 +137,35 @@ async def _run(ctx, mode, model, version, prompt, *, steps, guidance_scale, nega
         except Exception:
             pass  # Progress is best effort.
 
-    out_of_memory = False
-    async with _lock:
+    def work():
         try:
-            result = await anyio.to_thread.run_sync(
-                lambda: gen.generate(
-                    prompt,
-                    mode,
-                    negative_prompt=negative_prompt,
-                    steps=steps,
-                    guidance_scale=guidance_scale,
-                    version=version,
-                    seed=seed,
-                    on_progress=on_progress,
-                    output_dir=OUTPUT_DIR,
-                    **kwargs,
-                )
+            return gen.generate(
+                prompt,
+                mode,
+                negative_prompt=negative_prompt,
+                steps=steps,
+                guidance_scale=guidance_scale,
+                version=version,
+                seed=seed,
+                on_progress=on_progress,
+                output_dir=OUTPUT_DIR,
+                **kwargs,
             )
         except torch.cuda.OutOfMemoryError:
-            out_of_memory = True
-        if out_of_memory:
-            # Outside the except block, so the traceback no longer holds the pipeline.
-            gen.unload_pipeline()
-            raise ToolError(
-                "The GPU ran out of memory. The model was unloaded; try again, or use a smaller "
-                "width/height, or a smaller model (see list_models)."
-            ) from None
+            pass
+        # Still in the worker thread but outside the except block: the exception
+        # never leaves the thread, so nothing (e.g. anyio's Future) keeps the
+        # traceback, and with it the pipeline, alive.
+        gen.unload_pipeline()
+        return None
+
+    async with _lock:
+        result = await anyio.to_thread.run_sync(work)
+    if result is None:
+        raise ToolError(
+            "The GPU ran out of memory. The model was unloaded; try again, or use a smaller "
+            "width/height, or a smaller model (see list_models)."
+        )
 
     info = {
         "path": result.path,
@@ -233,7 +239,7 @@ async def generate_image(
         height: Height in pixels, same rules as width.
         steps: Number of inference steps. Default: the Model's own (e.g. 9 for z-image-turbo, 4 for flux2-klein-4b).
         guidance_scale: How closely to follow the prompt. Default: the Model's own (0 for the turbo Models).
-        negative_prompt: What to avoid. Ignored by Models that don't support it (flux2-klein-4b, guidance 0 Models).
+        negative_prompt: What to avoid. Not supported by flux2-klein-4b (ignored); has no effect at guidance_scale 0.
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
     version = _resolve_model(model, "txt2img")
@@ -277,7 +283,7 @@ async def edit_image(
             Ignored by flux2-klein-4b.
         steps: Number of inference steps. Default: the Model's own. With a strength below 1 only part of them run.
         guidance_scale: How closely to follow the prompt. Default: the Model's own.
-        negative_prompt: What to avoid. Ignored by Models that don't support it.
+        negative_prompt: What to avoid. Not supported by flux2-klein-4b (ignored); has no effect at guidance_scale 0.
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
     version = _resolve_model(model, "img2img")
@@ -308,7 +314,9 @@ async def inpaint(
     """Repaint part of an image from a prompt (inpainting). Supported by: {models}.
 
     The mask marks what to repaint: WHITE pixels are repainted, black pixels are kept. It is converted to grayscale
-    and, if its size differs from the image's, resized to it. The result has the saved PNG's absolute `path`, the
+    and, if its size differs from the image's, resized to it. The output keeps the input's size (z-image-turbo and
+    flux2-klein-4b round it down to a multiple of 16, and the input must come out between 64 and 2048 pixels on each
+    side); sdxl always outputs 1024px, so its input only needs 64 pixels or more. The result has the saved PNG's absolute `path`, the
     settings used (including the seed) and a small thumbnail.
 
     Args:
@@ -319,13 +327,13 @@ async def inpaint(
         strength: 0-1, how much the masked area changes: 1 (default) essentially ignores the original there.
         steps: Number of inference steps. Default: the Model's own.
         guidance_scale: How closely to follow the prompt. Default: the Model's own.
-        negative_prompt: What to avoid. Ignored by Models that don't support it.
+        negative_prompt: What to avoid. Not supported by flux2-klein-4b (ignored); has no effect at guidance_scale 0.
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
     version = _resolve_model(model, "inpaint")
     _check_common(steps, guidance_scale, strength, seed)
     image = _load_image(image_path, "image")
-    _check_input_size(image, version)
+    _check_input_size(image, version, check_max=version not in gen.SDXL_VERSIONS)
     mask = _load_image(mask_path, "mask", mode="L")
     if mask.size != image.size:
         mask = mask.resize(image.size, Image.NEAREST)

@@ -65,7 +65,7 @@ class FakePipeline:
                 raise self.fail
             # Like diffusers, img2img/inpaint only run steps * strength steps.
             n = max(1, int(num_inference_steps * strength)) if image is not None else num_inference_steps
-            self.scheduler = SimpleNamespace(timesteps=list(range(n)))
+            self._num_timesteps = n  # Like diffusers; scheduler.timesteps keeps its full length.
             for step in range(n):
                 time.sleep(self.delay)
                 if callback_on_step_end:

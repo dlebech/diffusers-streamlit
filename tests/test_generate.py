@@ -31,6 +31,7 @@ def test_seed_is_saved_and_returned(fake_pipe, tmp_path):
     assert result.seed == 1234
     assert fake_pipe.calls[0]["seed"] == 1234
     assert "Seed: 1234" in result.settings
+    assert "Mode: txt2img" in result.settings
     assert "Seed: 1234" in open(result.path[:-4] + ".txt").read()
 
 

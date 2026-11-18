@@ -76,7 +76,7 @@ def test_given_seed_is_passed_through(fakes):
 def test_invalid_seed_shows_error_and_does_not_generate(fakes, seed):
     at = run_app()
     at.text_input(key="txt2img-seed").set_value(seed).run()
-    assert [e.value for e in at.error] == ["The seed must be a whole number of 0 or more"]
+    assert [e.value for e in at.error] == ["The seed must be a whole number from 0 to 2**64-1"]
     assert not any(b.label == "Generate image" for b in at.button)
     assert fakes.generate == []
 

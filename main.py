@@ -4,14 +4,12 @@ import streamlit as st
 from PIL import Image
 
 from sd2.generate import (
-    DEFAULT_SIZE,
-    DEFAULT_STEPS_AND_GUIDANCE,
     FLUX_2_KLEIN_4B,
-    MODEL_DEFAULTS,
     MODEL_HINTS,
-    MODEL_SIZES,
     PIPELINE_NAMES,
     generate,
+    model_defaults,
+    model_size,
     model_versions,
     unload_pipeline,
 )
@@ -45,9 +43,7 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
     # The version is part of the slider keys so each model starts at its own
     # defaults (switching models resets the sliders to that model's defaults).
     version = kwargs.get("version")
-    default_steps, default_guidance = MODEL_DEFAULTS.get(
-        version, DEFAULT_STEPS_AND_GUIDANCE
-    )
+    default_steps, default_guidance = model_defaults(version)
     col1, col2 = st.columns(2)
     with col1:
         steps = st.slider(
@@ -88,7 +84,7 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
             if not 0 <= seed < 2**64:
                 raise ValueError
         except ValueError:
-            st.error("The seed must be a whole number of 0 or more")
+            st.error("The seed must be a whole number from 0 to 2**64-1")
             return
 
     if st.button("Generate image", key=f"{prefix}-btn"):
@@ -114,7 +110,7 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
 def width_and_height_sliders(prefix, version):
     # The version is part of the slider keys so each model starts at its own
     # default size (switching models resets the sliders to that model's size).
-    default_width, default_height = MODEL_SIZES.get(version, DEFAULT_SIZE)
+    default_width, default_height = model_size(version)
     col1, col2 = st.columns(2)
     with col1:
         width = st.slider(

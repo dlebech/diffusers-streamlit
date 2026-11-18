@@ -1,9 +1,11 @@
 import asyncio
 import base64
+import gc
 import io
 import json
 import os
 import sys
+import weakref
 
 import pytest
 import torch
@@ -11,6 +13,7 @@ from mcp import Client
 from PIL import Image
 
 import mcp_server
+from conftest import FakePipeline
 from sd2 import generate as gen
 
 
@@ -187,17 +190,26 @@ async def test_invalid_strength(client, tmp_path):
     assert "Invalid strength" in text
 
 
-async def test_out_of_memory_unloads_and_reports(client, fake_pipe, monkeypatch):
-    fake_pipe.fail = torch.cuda.OutOfMemoryError("CUDA out of memory")
-    unloaded = []
-    # Unloading inside the except block would leave the traceback holding the pipeline.
-    monkeypatch.setattr(gen, "unload_pipeline", lambda: unloaded.append(sys.exc_info()[0] is None))
+async def test_out_of_memory_unloads_and_reports(client, monkeypatch):
+    # Only a weakref to the pipeline survives outside generate()'s frame.
+    refs = []
+    alive_at_unload = []
+
+    def fake_get_pipeline(name, version="Z-Image Turbo", enable_cpu_offload=False):
+        pipe = FakePipeline()
+        pipe.fail = torch.cuda.OutOfMemoryError("CUDA out of memory")
+        refs.append(weakref.ref(pipe))
+        return pipe
+
+    def fake_unload():
+        gc.collect()
+        alive_at_unload.append(refs[-1]() is not None)
+
+    monkeypatch.setattr(gen, "get_pipeline", fake_get_pipeline)
+    monkeypatch.setattr(gen, "unload_pipeline", fake_unload)
     text = error_text(await client.call_tool("generate_image", {"prompt": "x", "model": "sdxl-turbo"}))
     assert "out of memory" in text and "smaller" in text
-    assert unloaded == [True]  # unloaded, and not while handling the error
-    # The server still works afterwards.
-    fake_pipe.fail = None
-    parse(await client.call_tool("generate_image", {"prompt": "x", "model": "sdxl-turbo"}))
+    assert alive_at_unload == [False]  # the pipeline is really freed when unloaded
 
 
 async def test_progress_notifications(client):
@@ -250,3 +262,16 @@ async def test_edit_rejects_bad_input_size(client, fake_pipe, tmp_path, tool, si
         args["mask_path"] = str(tmp_path / "m.png")
     assert "between 64 and 2048" in error_text(await client.call_tool(tool, args))
     assert fake_pipe.calls == []
+
+
+async def test_sdxl_inpaint_only_checks_the_minimum_input_size(client, fake_pipe, tmp_path):
+    big = str(tmp_path / "big.png")
+    mask = str(tmp_path / "m.png")
+    make_image(big, size=(3000, 2000))
+    make_image(mask, size=(3000, 2000))
+    args = {"image_path": big, "mask_path": mask, "prompt": "x", "model": "sdxl"}
+    parse(await client.call_tool("inpaint", args))
+    small = str(tmp_path / "small.png")
+    make_image(small, size=(10, 10))
+    text = error_text(await client.call_tool("inpaint", {**args, "image_path": small}))
+    assert "between 64 and 2048" in text
