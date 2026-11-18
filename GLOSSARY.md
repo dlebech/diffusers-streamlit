@@ -8,7 +8,7 @@ _Avoid_: version (older code calls a model `version`)
 
 **Mask**: the image that selects the area to change in inpaint. White = repaint, black = keep.
 
-**Strength**: how much img2img and inpaint change the input image. Ignored by FLUX.2 [klein].
+**Strength**: how much img2img and inpaint change the input image. Ignored by FLUX.2 [klein] in img2img.
 
 **Seed**: a number that makes a generation reproducible. Random when unset.
 

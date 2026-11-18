@@ -3,6 +3,7 @@ import base64
 import io
 import json
 import os
+import sys
 
 import pytest
 import torch
@@ -60,6 +61,7 @@ async def test_list_models(client):
     assert models["sdxl-turbo"]["tools"] == ["generate_image"]
     assert (models["sdxl-turbo"]["default_width"], models["sdxl-turbo"]["default_height"]) == (512, 512)
     assert models["sdxl-refiner"]["tools"] == ["edit_image"]
+    assert models["sdxl-refiner"]["modes"] == ["img2img"]
     assert models["sdxl"]["tools"] == ["generate_image", "inpaint"]
     assert models["sdxl"]["default_steps"] == 20 and models["sdxl"]["default_guidance_scale"] == 7.5
     assert "Turbo" in models["sdxl-turbo"]["hint"]
@@ -188,10 +190,11 @@ async def test_invalid_strength(client, tmp_path):
 async def test_out_of_memory_unloads_and_reports(client, fake_pipe, monkeypatch):
     fake_pipe.fail = torch.cuda.OutOfMemoryError("CUDA out of memory")
     unloaded = []
-    monkeypatch.setattr(gen, "unload_pipeline", lambda: unloaded.append(True))
+    # Unloading inside the except block would leave the traceback holding the pipeline.
+    monkeypatch.setattr(gen, "unload_pipeline", lambda: unloaded.append(sys.exc_info()[0] is None))
     text = error_text(await client.call_tool("generate_image", {"prompt": "x", "model": "sdxl-turbo"}))
     assert "out of memory" in text and "smaller" in text
-    assert unloaded == [True]
+    assert unloaded == [True]  # unloaded, and not while handling the error
     # The server still works afterwards.
     fake_pipe.fail = None
     parse(await client.call_tool("generate_image", {"prompt": "x", "model": "sdxl-turbo"}))
@@ -218,3 +221,32 @@ async def test_concurrent_calls_are_serialized(client, fake_pipe):
     assert sorted(i["seed"] for i in infos) == [0, 1, 2]
     assert fake_pipe.max_active == 1
     assert len(fake_pipe.calls) == 3
+
+
+async def test_progress_total_is_the_real_number_of_steps(client):
+    progress = []
+
+    async def on_progress(value, total, message):
+        progress.append((value, total))
+
+    path = os.path.join(mcp_server.OUTPUT_DIR, "in.png")
+    os.makedirs(mcp_server.OUTPUT_DIR, exist_ok=True)
+    make_image(path)
+    # 10 steps at strength 0.5 run 5.
+    parse(await client.call_tool(
+        "edit_image", {"image_path": path, "prompt": "x", "steps": 10, "strength": 0.5}, progress_callback=on_progress
+    ))
+    assert progress == [(i, 5) for i in range(1, 6)]
+
+
+@pytest.mark.parametrize("tool", ["edit_image", "inpaint"])
+@pytest.mark.parametrize("size", [(10, 10), (30, 200), (4000, 128)])
+async def test_edit_rejects_bad_input_size(client, fake_pipe, tmp_path, tool, size):
+    path = str(tmp_path / "in.png")
+    make_image(path, size=size)
+    args = {"image_path": path, "prompt": "x"}
+    if tool == "inpaint":
+        make_image(str(tmp_path / "m.png"), size=size)
+        args["mask_path"] = str(tmp_path / "m.png")
+    assert "between 64 and 2048" in error_text(await client.call_tool(tool, args))
+    assert fake_pipe.calls == []

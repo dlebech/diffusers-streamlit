@@ -1,3 +1,4 @@
+import os
 import re
 
 import pytest
@@ -121,3 +122,12 @@ def test_loader_keeps_one_pipeline(monkeypatch):
     assert b is not a and gen._loaded[1] is b
     gen.unload_pipeline()
     assert gen._loaded is None
+
+
+@pytest.mark.parametrize("prompt", ["AC/DC poster", "../escaped", "/etc/x", "...", "a\\b:c"])
+def test_prompt_cannot_escape_output_dir(fake_pipe, tmp_path, prompt):
+    out = tmp_path / "outputs"
+    result = gen.generate(prompt, "txt2img", steps=1, width=64, height=64, output_dir=str(out))
+    assert os.path.dirname(result.path) == str(out)
+    assert os.path.exists(result.path) and os.path.exists(result.settings_path)
+    assert os.listdir(tmp_path) == ["outputs"]

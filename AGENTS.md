@@ -21,5 +21,5 @@ A super minimal Streamlit app plus an MCP server for local image generation with
 
 - Python 3.12. Add dependencies with `uv add`, then regenerate `requirements.txt` with the `uv export` command in the README.
 - Keep the README in sync: it documents the models, licences, memory notes, the app and the server.
-- Adding a model means a row in `PIPELINES`, plus defaults and hints, the README models table and its licence.
+- Adding a model means a row in `PIPELINES`, plus defaults and hints, a slug in `MODEL_SLUGS`, the README models table and its licence, and the slug list in the README's MCP section.
 - Model downloads are big; don't trigger them in tests.

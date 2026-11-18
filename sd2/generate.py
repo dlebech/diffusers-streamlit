@@ -4,6 +4,7 @@ import inspect
 import os
 import re
 import secrets
+import threading
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -94,17 +95,30 @@ def model_versions(name: PIPELINE_NAMES) -> list[str]:
     return [version for (n, version) in PIPELINES if n == name]
 
 
+def model_defaults(version) -> tuple[int, float]:
+    """Default (steps, guidance scale) for a model."""
+    return MODEL_DEFAULTS.get(version, DEFAULT_STEPS_AND_GUIDANCE)
+
+
+def model_size(version) -> tuple[int, int]:
+    """Default txt2img (width, height) for a model."""
+    return MODEL_SIZES.get(version, DEFAULT_SIZE)
+
+
 # The one loaded pipeline: ((name, version, enable_cpu_offload), pipeline).
 _loaded: tuple[tuple, DiffusionPipeline] | None = None
+# Guards _loaded: the app runs each browser session in its own thread.
+_load_lock = threading.RLock()
 
 
 def unload_pipeline():
     """Frees the loaded pipeline (and its GPU memory), if any."""
     global _loaded
-    _loaded = None
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    with _load_lock:
+        _loaded = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
 
 def get_pipeline(
@@ -118,23 +132,24 @@ def get_pipeline(
         raise Exception(f"Could not find pipeline {name} and version {version}")
 
     key = (name, version, enable_cpu_offload)
-    if _loaded is not None and _loaded[0] == key:
-        return _loaded[1]
-    # Free the old pipeline before loading the new one.
-    unload_pipeline()
+    with _load_lock:
+        if _loaded is not None and _loaded[0] == key:
+            return _loaded[1]
+        # Free the old pipeline before loading the new one.
+        unload_pipeline()
 
-    pipeline_class, model_id, kwargs = PIPELINES[(name, version)]
-    pipe = pipeline_class.from_pretrained(model_id, **kwargs)
-    # Potential speedup for XL, but didn't work super great for me.
-    # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+        pipeline_class, model_id, kwargs = PIPELINES[(name, version)]
+        pipe = pipeline_class.from_pretrained(model_id, **kwargs)
+        # Potential speedup for XL, but didn't work super great for me.
+        # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 
-    if enable_cpu_offload:
-        print("Enabling CPU offload for pipeline")
-        pipe.enable_model_cpu_offload()
-    else:
-        pipe = pipe.to("cuda")
-    _loaded = (key, pipe)
-    return pipe
+        if enable_cpu_offload:
+            print("Enabling CPU offload for pipeline")
+            pipe.enable_model_cpu_offload()
+        else:
+            pipe = pipe.to("cuda")
+        _loaded = (key, pipe)
+        return pipe
 
 
 def gpu_memory_bytes() -> int:
@@ -156,11 +171,10 @@ def needs_cpu_offload(version, enable_cpu_offload=False) -> bool:
 @dataclass
 class GenerationResult:
     image: object  # PIL.Image.Image
-    path: str  # the saved PNG; the settings are in the .txt next to it
+    path: str  # the saved PNG
+    settings_path: str  # the .txt next to it
     settings: str
     seed: int
-    size: tuple[int, int]
-    version: str
     enable_cpu_offload: bool
     ignored: list[str] = field(default_factory=list)
 
@@ -194,7 +208,9 @@ def generate(
 
     def callback(pipe, step, timestep, callback_kwargs):
         if on_progress:
-            on_progress(step, steps)
+            # img2img/inpaint run fewer steps than asked for (steps * strength).
+            total = len(getattr(getattr(pipe, "scheduler", None), "timesteps", ())) or steps
+            on_progress(step, total)
         return callback_kwargs
 
     # NOTE: This code is not being used, since the combined XL 1.0 and refiner
@@ -290,7 +306,7 @@ def generate(
 
     filename = os.path.join(
         output_dir,
-        re.sub(r"\s+", "_", prompt)[:50]
+        (re.sub(r"[^\w-]+", "_", prompt).strip("_")[:50] or "image")
         + f"_{datetime.datetime.now().timestamp()}",
     )
     settings = settings_text(
@@ -312,10 +328,9 @@ def generate(
     return GenerationResult(
         image=image,
         path=os.path.abspath(f"{filename}.png"),
+        settings_path=os.path.abspath(f"{filename}.txt"),
         settings=settings,
         seed=seed,
-        size=image.size,
-        version=version,
         enable_cpu_offload=enable_cpu_offload,
         ignored=sorted(ignored),
     )

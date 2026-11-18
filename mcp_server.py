@@ -48,6 +48,16 @@ def _models_supporting(mode):
     return [slug for slug, version in gen.MODEL_SLUGS.items() if (mode, version) in gen.PIPELINES]
 
 
+def _supported_by(mode):
+    """Fills "{models}" in a tool's docstring with the slugs that support the mode."""
+
+    def decorate(fn):
+        fn.__doc__ = fn.__doc__.replace("{models}", ", ".join(_models_supporting(mode)))
+        return fn
+
+    return decorate
+
+
 def _resolve_model(model, mode):
     version = gen.MODEL_SLUGS.get(model)
     if version is None:
@@ -65,6 +75,19 @@ def _check_size(width, height):
         if not MIN_SIZE <= value <= MAX_SIZE or value % 16:
             raise ToolError(
                 f"Invalid {name} {value}: it must be a multiple of 16 between {MIN_SIZE} and {MAX_SIZE}."
+            )
+
+
+def _check_input_size(image, version):
+    """The output has the input's size (rounded down to a multiple of 16 for the newer Models)."""
+    width, height = image.size
+    if version not in gen.SDXL_VERSIONS:
+        width, height = width // 16 * 16, height // 16 * 16
+    for name, value in (("width", width), ("height", height)):
+        if not MIN_SIZE <= value <= MAX_SIZE:
+            raise ToolError(
+                f"The input image is {image.width}x{image.height}, so the output {name} would be {value}: "
+                f"it must be between {MIN_SIZE} and {MAX_SIZE}. Resize the image first."
             )
 
 
@@ -98,10 +121,9 @@ def _thumbnail(image):
     return McpImage(data=buffer.getvalue(), format="png")
 
 
-async def _run(ctx, mode, model, prompt, *, steps, guidance_scale, negative_prompt, seed, **kwargs):
+async def _run(ctx, mode, model, version, prompt, *, steps, guidance_scale, negative_prompt, seed, **kwargs):
     """Runs one generation in a worker thread, queued behind the lock."""
-    version = _resolve_model(model, mode)
-    default_steps, default_guidance = gen.MODEL_DEFAULTS.get(version, gen.DEFAULT_STEPS_AND_GUIDANCE)
+    default_steps, default_guidance = gen.model_defaults(version)
     steps = default_steps if steps is None else steps
     guidance_scale = default_guidance if guidance_scale is None else guidance_scale
 
@@ -112,6 +134,7 @@ async def _run(ctx, mode, model, prompt, *, steps, guidance_scale, negative_prom
         except Exception:
             pass  # Progress is best effort.
 
+    out_of_memory = False
     async with _lock:
         try:
             result = await anyio.to_thread.run_sync(
@@ -129,11 +152,14 @@ async def _run(ctx, mode, model, prompt, *, steps, guidance_scale, negative_prom
                 )
             )
         except torch.cuda.OutOfMemoryError:
+            out_of_memory = True
+        if out_of_memory:
+            # Outside the except block, so the traceback no longer holds the pipeline.
             gen.unload_pipeline()
             raise ToolError(
                 "The GPU ran out of memory. The model was unloaded; try again, or use a smaller "
                 "width/height, or a smaller model (see list_models)."
-            )
+            ) from None
 
     info = {
         "path": result.path,
@@ -142,14 +168,14 @@ async def _run(ctx, mode, model, prompt, *, steps, guidance_scale, negative_prom
         "prompt": prompt,
         "negative_prompt": negative_prompt or None,
         "seed": result.seed,
-        "width": result.size[0],
-        "height": result.size[1],
+        "width": result.image.width,
+        "height": result.image.height,
         "steps": steps,
         "guidance_scale": guidance_scale,
         "cpu_offload": result.enable_cpu_offload,
         # Settings the Model doesn't use, e.g. negative_prompt for FLUX.2.
         "ignored": result.ignored,
-        "settings_path": os.path.splitext(result.path)[0] + ".txt",
+        "settings_path": result.settings_path,
     }
     if mode != "txt2img":
         info["strength"] = kwargs["strength"]
@@ -162,8 +188,8 @@ def list_models() -> list[dict]:
     (generate_image, edit_image, inpaint), default steps/guidance_scale/size and a usage hint."""
     models = []
     for slug, version in gen.MODEL_SLUGS.items():
-        steps, guidance = gen.MODEL_DEFAULTS.get(version, gen.DEFAULT_STEPS_AND_GUIDANCE)
-        width, height = gen.MODEL_SIZES.get(version, gen.DEFAULT_SIZE)
+        steps, guidance = gen.model_defaults(version)
+        width, height = gen.model_size(version)
         modes = {mode: gen.PIPELINES[(mode, version)][1] for mode in TOOL_FOR_MODE if (mode, version) in gen.PIPELINES}
         models.append(
             {
@@ -171,6 +197,7 @@ def list_models() -> list[dict]:
                 "name": version,
                 "repo": next(iter(modes.values())),
                 "tools": [TOOL_FOR_MODE[mode] for mode in modes],
+                "modes": list(modes),
                 "default_steps": steps,
                 "default_guidance_scale": guidance,
                 "default_width": width,
@@ -182,6 +209,7 @@ def list_models() -> list[dict]:
 
 
 @mcp.tool()
+@_supported_by("txt2img")
 async def generate_image(
     prompt: str,
     ctx: Context,
@@ -193,7 +221,7 @@ async def generate_image(
     negative_prompt: str | None = None,
     seed: int | None = None,
 ) -> list:
-    """Generate an image from a text prompt (txt2img). Supported by z-image-turbo, flux2-klein-4b, sdxl and sdxl-turbo.
+    """Generate an image from a text prompt (txt2img). Supported by: {models}.
 
     The image is saved as a PNG; the result has its absolute `path`, the settings used (including the seed) and a
     small thumbnail. Calls are queued, and the first use of a Model loads it (slow).
@@ -209,19 +237,20 @@ async def generate_image(
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
     version = _resolve_model(model, "txt2img")
-    default_width, default_height = gen.MODEL_SIZES.get(version, gen.DEFAULT_SIZE)
+    default_width, default_height = gen.model_size(version)
     width = default_width if width is None else width
     height = default_height if height is None else height
     _check_size(width, height)
     _check_common(steps, guidance_scale, seed=seed)
     return await _run(
-        ctx, "txt2img", model, prompt,
+        ctx, "txt2img", model, version, prompt,
         steps=steps, guidance_scale=guidance_scale, negative_prompt=negative_prompt, seed=seed,
         width=width, height=height,
     )  # fmt: skip
 
 
 @mcp.tool()
+@_supported_by("img2img")
 async def edit_image(
     image_path: str,
     prompt: str,
@@ -233,11 +262,12 @@ async def edit_image(
     negative_prompt: str | None = None,
     seed: int | None = None,
 ) -> list:
-    """Edit or restyle an existing image from a prompt (img2img). Supported by z-image-turbo, flux2-klein-4b and
-    sdxl-refiner (the refiner only polishes details).
+    """Edit or restyle an existing image from a prompt (img2img). Supported by: {models}
+    (sdxl-refiner only polishes details).
 
     The output keeps the input's aspect ratio (z-image-turbo and flux2-klein-4b round the size down to a multiple of
-    16). The result has the saved PNG's absolute `path`, the settings used (including the seed) and a small thumbnail.
+    16). The input must come out between 64 and 2048 pixels on each side. The result has the saved PNG's absolute
+    `path`, the settings used (including the seed) and a small thumbnail.
 
     Args:
         image_path: Local path of the input image (png or jpg).
@@ -250,17 +280,19 @@ async def edit_image(
         negative_prompt: What to avoid. Ignored by Models that don't support it.
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
-    _resolve_model(model, "img2img")
+    version = _resolve_model(model, "img2img")
     _check_common(steps, guidance_scale, strength, seed)
     image = _load_image(image_path, "image")
+    _check_input_size(image, version)
     return await _run(
-        ctx, "img2img", model, prompt,
+        ctx, "img2img", model, version, prompt,
         steps=steps, guidance_scale=guidance_scale, negative_prompt=negative_prompt, seed=seed,
         image_input=image, strength=strength,
     )  # fmt: skip
 
 
 @mcp.tool()
+@_supported_by("inpaint")
 async def inpaint(
     image_path: str,
     mask_path: str,
@@ -273,7 +305,7 @@ async def inpaint(
     negative_prompt: str | None = None,
     seed: int | None = None,
 ) -> list:
-    """Repaint part of an image from a prompt (inpainting). Supported by z-image-turbo, flux2-klein-4b and sdxl.
+    """Repaint part of an image from a prompt (inpainting). Supported by: {models}.
 
     The mask marks what to repaint: WHITE pixels are repainted, black pixels are kept. It is converted to grayscale
     and, if its size differs from the image's, resized to it. The result has the saved PNG's absolute `path`, the
@@ -290,15 +322,16 @@ async def inpaint(
         negative_prompt: What to avoid. Ignored by Models that don't support it.
         seed: Whole number for reproducible results. Default: random; the seed used is in the result.
     """
-    _resolve_model(model, "inpaint")
+    version = _resolve_model(model, "inpaint")
     _check_common(steps, guidance_scale, strength, seed)
     image = _load_image(image_path, "image")
+    _check_input_size(image, version)
     mask = _load_image(mask_path, "mask", mode="L")
     if mask.size != image.size:
         mask = mask.resize(image.size, Image.NEAREST)
     mask = mask.point(lambda v: 255 if v > 127 else 0)
     return await _run(
-        ctx, "inpaint", model, prompt,
+        ctx, "inpaint", model, version, prompt,
         steps=steps, guidance_scale=guidance_scale, negative_prompt=negative_prompt, seed=seed,
         image_input=image, mask_input=mask, strength=strength,
     )  # fmt: skip
