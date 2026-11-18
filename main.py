@@ -4,15 +4,14 @@ import streamlit as st
 from PIL import Image
 
 from sd2.generate import (
-    DEFAULT_SIZE,
-    DEFAULT_STEPS_AND_GUIDANCE,
     FLUX_2_KLEIN_4B,
-    MODEL_DEFAULTS,
     MODEL_HINTS,
-    MODEL_SIZES,
     PIPELINE_NAMES,
     generate,
+    model_defaults,
+    model_size,
     model_versions,
+    unload_pipeline,
 )
 
 DEFAULT_PROMPT = "border collie puppy"
@@ -44,9 +43,7 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
     # The version is part of the slider keys so each model starts at its own
     # defaults (switching models resets the sliders to that model's defaults).
     version = kwargs.get("version")
-    default_steps, default_guidance = MODEL_DEFAULTS.get(
-        version, DEFAULT_STEPS_AND_GUIDANCE
-    )
+    default_steps, default_guidance = model_defaults(version)
     col1, col2 = st.columns(2)
     with col1:
         steps = st.slider(
@@ -75,9 +72,25 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
         value=False,
     )
 
+    seed_text = st.text_input(
+        "Seed (leave empty for a random seed)",
+        value="",
+        key=f"{prefix}-seed",
+    )
+    seed = None
+    if seed_text.strip():
+        try:
+            seed = int(seed_text)
+            if not 0 <= seed < 2**64:
+                raise ValueError
+        except ValueError:
+            st.error("The seed must be a whole number from 0 to 2**64-1")
+            return
+
     if st.button("Generate image", key=f"{prefix}-btn"):
         with st.spinner("Generating image..."):
-            image = generate(
+            progress = st.progress(0)
+            result = generate(
                 prompt,
                 pipeline_name,
                 negative_prompt=negative_prompt,
@@ -85,16 +98,19 @@ def prompt_and_generate_button(prefix, pipeline_name: PIPELINE_NAMES, **kwargs):
                 guidance_scale=guidance_scale,
                 enable_attention_slicing=enable_attention_slicing,
                 enable_cpu_offload=enable_cpu_offload,
+                seed=seed,
+                on_progress=lambda step, total: progress.progress(step / total),
                 **kwargs,
             )
-            set_image(OUTPUT_IMAGE_KEY, image.copy())
-        st.image(image)
+            set_image(OUTPUT_IMAGE_KEY, result.image.copy())
+        st.image(result.image)
+        st.caption(f"Seed: {result.seed}")
 
 
 def width_and_height_sliders(prefix, version):
     # The version is part of the slider keys so each model starts at its own
     # default size (switching models resets the sliders to that model's size).
-    default_width, default_height = MODEL_SIZES.get(version, DEFAULT_SIZE)
+    default_width, default_height = model_size(version)
     col1, col2 = st.columns(2)
     with col1:
         width = st.slider(
@@ -262,6 +278,9 @@ def main():
         img2img_tab()
 
     with st.sidebar:
+        if st.button("Unload model (frees GPU memory)"):
+            unload_pipeline()
+            st.toast("Model unloaded")
         st.header("Latest Output Image")
         output_image = get_image(OUTPUT_IMAGE_KEY)
         if output_image:
