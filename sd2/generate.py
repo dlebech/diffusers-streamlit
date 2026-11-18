@@ -3,9 +3,10 @@ import datetime
 import inspect
 import os
 import re
-from typing import Literal
+import secrets
+from dataclasses import dataclass, field
+from typing import Callable, Literal
 
-import streamlit as st
 import torch
 from diffusers import (
     DiffusionPipeline,
@@ -54,6 +55,15 @@ PIPELINES = {
     ("inpaint", SD_XL_10): (StableDiffusionXLInpaintPipeline, "stabilityai/stable-diffusion-xl-base-1.0", _SDXL_KWARGS),
 }
 
+# Slugs for naming Models outside the UI (e.g. in the MCP server), in UI order.
+MODEL_SLUGS = {
+    "z-image-turbo": Z_IMAGE_TURBO,
+    "flux2-klein-4b": FLUX_2_KLEIN_4B,
+    "sdxl": SD_XL_10,
+    "sdxl-turbo": SD_XL_TURBO,
+    "sdxl-refiner": SD_XL_10_REFINER,
+}
+
 # Short usage hints shown below the model selector.
 MODEL_HINTS = {
     Z_IMAGE_TURBO: "Turbo model: 8-9 steps, guidance 0 (at guidance 0 the negative prompt has no effect). CPU offload is turned on automatically on GPUs with less than 24GB.",
@@ -84,14 +94,34 @@ def model_versions(name: PIPELINE_NAMES) -> list[str]:
     return [version for (n, version) in PIPELINES if n == name]
 
 
-@st.cache_resource(max_entries=1)
+# The one loaded pipeline: ((name, version, enable_cpu_offload), pipeline).
+_loaded: tuple[tuple, DiffusionPipeline] | None = None
+
+
+def unload_pipeline():
+    """Frees the loaded pipeline (and its GPU memory), if any."""
+    global _loaded
+    _loaded = None
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def get_pipeline(
     name: PIPELINE_NAMES,
     version: MODEL_VERSIONS = Z_IMAGE_TURBO,
     enable_cpu_offload=False,
 ) -> DiffusionPipeline:
+    """Loads a pipeline, keeping only the most recent one in memory."""
+    global _loaded
     if (name, version) not in PIPELINES:
         raise Exception(f"Could not find pipeline {name} and version {version}")
+
+    key = (name, version, enable_cpu_offload)
+    if _loaded is not None and _loaded[0] == key:
+        return _loaded[1]
+    # Free the old pipeline before loading the new one.
+    unload_pipeline()
 
     pipeline_class, model_id, kwargs = PIPELINES[(name, version)]
     pipe = pipeline_class.from_pretrained(model_id, **kwargs)
@@ -103,7 +133,36 @@ def get_pipeline(
         pipe.enable_model_cpu_offload()
     else:
         pipe = pipe.to("cuda")
+    _loaded = (key, pipe)
     return pipe
+
+
+def gpu_memory_bytes() -> int:
+    return torch.cuda.get_device_properties(0).total_memory
+
+
+def needs_cpu_offload(version, enable_cpu_offload=False) -> bool:
+    """CPU offload is on when asked for, or when the model needs it on this GPU."""
+    if (
+        version not in SDXL_VERSIONS
+        and not enable_cpu_offload
+        and gpu_memory_bytes() < OFFLOAD_REQUIRED_BELOW_BYTES
+    ):
+        print(f"Enabling CPU offload for {version} (needs more than 24GB of GPU memory otherwise)")
+        return True
+    return enable_cpu_offload
+
+
+@dataclass
+class GenerationResult:
+    image: object  # PIL.Image.Image
+    path: str  # the saved PNG; the settings are in the .txt next to it
+    settings: str
+    seed: int
+    size: tuple[int, int]
+    version: str
+    enable_cpu_offload: bool
+    ignored: list[str] = field(default_factory=list)
 
 
 def generate(
@@ -120,13 +179,22 @@ def generate(
     enable_cpu_offload=False,
     version=Z_IMAGE_TURBO,
     strength=1.0,
-):
-    """Generates an image based on the given prompt and pipeline name"""
+    seed: int | None = None,
+    on_progress: Callable[[int, int], None] | None = None,
+    output_dir="outputs",
+) -> GenerationResult:
+    """Generates an image based on the given prompt and pipeline name.
+
+    A random seed is used if none is given. on_progress(step, steps) is called
+    after each denoising step (step counts from 0).
+    """
     negative_prompt = negative_prompt if negative_prompt else None
-    p = st.progress(0)
+    if seed is None:
+        seed = secrets.randbelow(2**32)
 
     def callback(pipe, step, timestep, callback_kwargs):
-        p.progress(step / steps)
+        if on_progress:
+            on_progress(step, steps)
         return callback_kwargs
 
     # NOTE: This code is not being used, since the combined XL 1.0 and refiner
@@ -137,13 +205,7 @@ def generate(
     except:
         pass
 
-    if (
-        version not in SDXL_VERSIONS
-        and not enable_cpu_offload
-        and torch.cuda.get_device_properties(0).total_memory < OFFLOAD_REQUIRED_BELOW_BYTES
-    ):
-        print(f"Enabling CPU offload for {version} (needs more than 24GB of GPU memory otherwise)")
-        enable_cpu_offload = True
+    enable_cpu_offload = needs_cpu_offload(version, enable_cpu_offload)
 
     pipe = get_pipeline(
         pipeline_name, version=version, enable_cpu_offload=enable_cpu_offload
@@ -161,6 +223,8 @@ def generate(
         num_inference_steps=steps,
         callback_on_step_end=callback,
         guidance_scale=guidance_scale,
+        # On the CPU so it also works with CPU offload.
+        generator=torch.Generator("cpu").manual_seed(seed),
     )
 
     if pipeline_name == "inpaint" and image_input and mask_input:
@@ -222,30 +286,39 @@ def generate(
         images = refiner(image=images, denoising_start=high_noise_frac, **kwargs).images
     image = images[0]
 
-    os.makedirs("outputs", exist_ok=True)
+    os.makedirs(output_dir, exist_ok=True)
 
-    filename = (
-        "outputs/"
-        + re.sub(r"\s+", "_", prompt)[:50]
-        + f"_{datetime.datetime.now().timestamp()}"
+    filename = os.path.join(
+        output_dir,
+        re.sub(r"\s+", "_", prompt)[:50]
+        + f"_{datetime.datetime.now().timestamp()}",
+    )
+    settings = settings_text(
+        prompt,
+        pipeline_name,
+        version=version if not refiner_version else f"{version} + {refiner_version}",
+        negative_prompt=negative_prompt,
+        steps=steps,
+        guidance_scale=guidance_scale,
+        size=image.size,
+        strength=strength,
+        enable_cpu_offload=enable_cpu_offload,
+        ignored=ignored,
+        seed=seed,
     )
     image.save(f"{filename}.png")
     with open(f"{filename}.txt", "w") as f:
-        f.write(
-            settings_text(
-                prompt,
-                pipeline_name,
-                version=version if not refiner_version else f"{version} + {refiner_version}",
-                negative_prompt=negative_prompt,
-                steps=steps,
-                guidance_scale=guidance_scale,
-                size=image.size,
-                strength=strength,
-                enable_cpu_offload=enable_cpu_offload,
-                ignored=ignored,
-            )
-        )
-    return image
+        f.write(settings)
+    return GenerationResult(
+        image=image,
+        path=os.path.abspath(f"{filename}.png"),
+        settings=settings,
+        seed=seed,
+        size=image.size,
+        version=version,
+        enable_cpu_offload=enable_cpu_offload,
+        ignored=sorted(ignored),
+    )
 
 
 def settings_text(
@@ -259,6 +332,7 @@ def settings_text(
     strength,
     enable_cpu_offload,
     ignored=frozenset(),
+    seed=None,
 ) -> str:
     """Human-readable generation settings, saved next to each output image."""
 
@@ -284,5 +358,7 @@ def settings_text(
     ]
     if pipeline_name != "txt2img":
         lines.append(f"Strength: {value('strength', strength)}")
+    if seed is not None:
+        lines.append(f"Seed: {seed}")
     lines.append(f"CPU offload: {'yes' if enable_cpu_offload else 'no'}")
     return "\n".join(lines) + "\n"
