@@ -1,5 +1,7 @@
+import gc
 import os
 import re
+import weakref
 
 import pytest
 
@@ -122,6 +124,143 @@ def test_loader_keeps_one_pipeline(monkeypatch):
     b = gen.get_pipeline("txt2img", gen.SD_XL_10)
     assert b is not a and gen._loaded[1] is b
     gen.unload_pipeline()
+    assert gen._loaded is None
+
+
+@pytest.fixture
+def fake_loader(monkeypatch):
+    """Fake pipeline classes for two modes and the same/another model; returns the event log."""
+    events = []
+
+    class Pipe:
+        def __init__(self, source):
+            self.source = source
+
+        def to(self, device):
+            events.append(("to", type(self).__name__, device))
+            return self
+
+        def remove_all_hooks(self):
+            events.append(("remove_all_hooks", type(self).__name__))
+
+        def enable_model_cpu_offload(self):
+            events.append(("enable_model_cpu_offload", type(self).__name__))
+
+        @classmethod
+        def from_pretrained(cls, repo, **kwargs):
+            events.append(("from_pretrained", cls.__name__, repo))
+            return cls(repo)
+
+        @classmethod
+        def from_pipe(cls, pipeline, **kwargs):
+            events.append(("from_pipe", cls.__name__, type(pipeline).__name__, kwargs))
+            return cls(pipeline.source)
+
+    class Txt2Img(Pipe):
+        pass
+
+    class Inpaint(Pipe):
+        pass
+
+    dtype = dict(dtype="bf16")
+    monkeypatch.setitem(gen.PIPELINES, ("txt2img", gen.Z_IMAGE_TURBO), (Txt2Img, "z", dtype))
+    monkeypatch.setitem(gen.PIPELINES, ("img2img", gen.Z_IMAGE_TURBO), (Txt2Img, "z", dtype))
+    monkeypatch.setitem(gen.PIPELINES, ("inpaint", gen.Z_IMAGE_TURBO), (Inpaint, "z", dtype))
+    monkeypatch.setitem(gen.PIPELINES, ("txt2img", gen.FLUX_2_KLEIN_4B), (Txt2Img, "flux", dtype))
+    # Start and end with nothing loaded, even if a test fails.
+    monkeypatch.setattr(gen, "_loaded", None)
+    monkeypatch.setattr(gen, "_trim_host_memory", lambda: events.append(("trim",)))
+    monkeypatch.setattr(gen, "unload_pipeline", lambda real=gen.unload_pipeline: (events.append(("unload",)), real()))
+    return events
+
+
+@pytest.mark.parametrize("offload", [True, False])
+def test_mode_switch_reuses_components(fake_loader, offload):
+    events = fake_loader
+    old = weakref.ref(gen.get_pipeline("txt2img", gen.Z_IMAGE_TURBO, offload))
+    events.clear()
+    b = gen.get_pipeline("inpaint", gen.Z_IMAGE_TURBO, offload)
+    assert type(b).__name__ == "Inpaint" and b.source == "z"
+    assert gen._loaded == (("inpaint", gen.Z_IMAGE_TURBO, offload), b)
+    assert ("remove_all_hooks", "Txt2Img") in events
+    # The dtype is passed on, or from_pipe would cast the weights to float32.
+    assert ("from_pipe", "Inpaint", "Txt2Img", {"dtype": "bf16"}) in events
+    assert events.index(("remove_all_hooks", "Txt2Img")) < events.index(("from_pipe", "Inpaint", "Txt2Img", {"dtype": "bf16"}))
+    assert not any(e[0] in ("from_pretrained", "unload") for e in events)
+    last = ("enable_model_cpu_offload", "Inpaint") if offload else ("to", "Inpaint", "cuda")
+    assert events[-1] == last
+    # Only the new pipeline holds the components.
+    gc.collect()
+    assert old() is None
+
+
+def test_mode_switch_same_class_returns_same_pipeline(fake_loader):
+    events = fake_loader
+    a = gen.get_pipeline("txt2img", gen.Z_IMAGE_TURBO, True)
+    events.clear()
+    assert gen.get_pipeline("img2img", gen.Z_IMAGE_TURBO, True) is a
+    assert gen._loaded == (("img2img", gen.Z_IMAGE_TURBO, True), a)
+    assert events == []
+
+
+def test_model_or_offload_switch_reloads(fake_loader):
+    events = fake_loader
+    gen.get_pipeline("txt2img", gen.Z_IMAGE_TURBO, True)
+    events.clear()
+    b = gen.get_pipeline("txt2img", gen.FLUX_2_KLEIN_4B, True)
+    assert events[:3] == [("unload",), ("trim",), ("from_pretrained", "Txt2Img", "flux")]
+    events.clear()
+    c = gen.get_pipeline("txt2img", gen.FLUX_2_KLEIN_4B, False)
+    assert c is not b
+    assert events[:3] == [("unload",), ("trim",), ("from_pretrained", "Txt2Img", "flux")]
+
+
+def test_failed_mode_switch_leaves_nothing_loaded(fake_loader, monkeypatch):
+    gen.get_pipeline("txt2img", gen.Z_IMAGE_TURBO, True)
+    inpaint = gen.PIPELINES[("inpaint", gen.Z_IMAGE_TURBO)][0]
+
+    def broken(pipeline, **kwargs):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(inpaint, "from_pipe", broken)
+    with pytest.raises(RuntimeError, match="boom"):
+        gen.get_pipeline("inpaint", gen.Z_IMAGE_TURBO, True)
+    assert gen._loaded is None
+
+
+def test_unload_trims_host_memory(monkeypatch):
+    trims = []
+
+    class Libc:
+        def malloc_trim(self, pad):
+            trims.append(pad)
+
+    monkeypatch.setattr(gen.ctypes, "CDLL", lambda name: Libc())
+    gen.unload_pipeline()
+    assert trims == [0]
+
+
+def test_missing_malloc_trim_is_harmless(monkeypatch):
+    names = []
+
+    def libc_without_malloc_trim(name):
+        names.append(name)
+        return object()
+
+    # libc without malloc_trim (e.g. macOS).
+    monkeypatch.setattr(gen.ctypes, "CDLL", libc_without_malloc_trim)
+    gen.unload_pipeline()
+    assert len(names) == 1
+
+    def no_libc(name):
+        names.append(name)
+        raise OSError("no libc")
+
+    # No libc to be found (e.g. Windows): falls back to libc.so.6, which fails.
+    monkeypatch.setattr(gen.ctypes, "CDLL", no_libc)
+    monkeypatch.setattr(gen.ctypes.util, "find_library", lambda name: None)
+    gen.unload_pipeline()
+    assert names[-1] == "libc.so.6"
     assert gen._loaded is None
 
 
