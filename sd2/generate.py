@@ -2,11 +2,13 @@ import ctypes
 import ctypes.util
 import gc
 import datetime
+import functools
 import inspect
 import os
 import re
 import secrets
 import threading
+import traceback
 from dataclasses import dataclass, field
 from typing import Callable, Literal
 
@@ -113,19 +115,38 @@ _loaded: tuple[tuple, DiffusionPipeline] | None = None
 _load_lock = threading.RLock()
 
 
+@functools.cache
+def _malloc_trim():
+    """glibc's malloc_trim, or None. Looked up once: find_library runs ldconfig."""
+    try:
+        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
+    except OSError:
+        return None
+    return getattr(libc, "malloc_trim", None)
+
+
 def _trim_host_memory():
     """Returns freed heap memory to the OS (glibc only; a no-op elsewhere).
 
     glibc keeps freed memory in its arenas, so without this an unloaded model
     can stay in the process's RSS.
     """
-    try:
-        libc = ctypes.CDLL(ctypes.util.find_library("c") or "libc.so.6")
-    except OSError:
-        return
-    malloc_trim = getattr(libc, "malloc_trim", None)
+    malloc_trim = _malloc_trim()
     if malloc_trim is not None:
         malloc_trim(0)
+
+
+def _trims_host_memory_after(fn):
+    """Runs _trim_host_memory() after each call to fn, also when it raises."""
+
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _trim_host_memory()
+
+    return wrapper
 
 
 def unload_pipeline():
@@ -158,32 +179,41 @@ def get_pipeline(
     with _load_lock:
         if _loaded is not None and _loaded[0] == key:
             return _loaded[1]
-        if _loaded is not None and _loaded[0][1:] == key[1:]:
-            # Same model, other mode: reuse its components.
-            old = _loaded[1]
-            if type(old) is pipeline_class:
-                _loaded = (key, old)
-                return old
-            # Drop the offload hooks first so from_pipe's .to(dtype) acts on plain modules.
-            _loaded = None
-            old.remove_all_hooks()
-            # from_pipe casts to float32 unless given the dtype. If it fails,
-            # nothing is loaded and the caller can unload to free the memory.
-            pipe = pipeline_class.from_pipe(old, dtype=kwargs["dtype"])
-            # Only the new pipeline holds the components now.
-            del old
-        else:
-            # Free the old pipeline before loading the new one.
-            unload_pipeline()
-            pipe = pipeline_class.from_pretrained(model_id, **kwargs)
-            # Potential speedup for XL, but didn't work super great for me.
-            # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
+        old = pipe = None
+        try:
+            if _loaded is not None and _loaded[0][1:] == key[1:]:
+                # Same model, other mode: reuse its components.
+                old = _loaded[1]
+                if type(old) is pipeline_class:
+                    _loaded = (key, old)
+                    return old
+                # Drop the offload hooks first so from_pipe's .to(dtype) acts on plain modules.
+                _loaded = None
+                old.remove_all_hooks()
+                # from_pipe casts to float32 unless given the dtype.
+                pipe = pipeline_class.from_pipe(old, dtype=kwargs["dtype"])
+                # Only the new pipeline holds the components now.
+                old = None
+            else:
+                # Free the old pipeline before loading the new one.
+                unload_pipeline()
+                pipe = pipeline_class.from_pretrained(model_id, **kwargs)
+                # Potential speedup for XL, but didn't work super great for me.
+                # pipe.unet = torch.compile(pipe.unet, mode="reduce-overhead", fullgraph=True)
 
-        if enable_cpu_offload:
-            print("Enabling CPU offload for pipeline")
-            pipe.enable_model_cpu_offload()
-        else:
-            pipe = pipe.to("cuda")
+            if enable_cpu_offload:
+                print("Enabling CPU offload for pipeline")
+                pipe.enable_model_cpu_offload()
+            else:
+                pipe = pipe.to("cuda")
+        except BaseException as e:
+            # Nothing is loaded now. Drop every reference to the half-loaded
+            # model, including the locals of the failed calls' frames in the
+            # traceback (the traceback itself is kept), then free its memory.
+            old = pipe = None
+            traceback.clear_frames(e.__traceback__)
+            unload_pipeline()
+            raise
         _loaded = (key, pipe)
         return pipe
 
@@ -215,6 +245,7 @@ class GenerationResult:
     ignored: list[str] = field(default_factory=list)
 
 
+@_trims_host_memory_after
 def generate(
     prompt,
     pipeline_name: PIPELINE_NAMES,
@@ -362,10 +393,8 @@ def generate(
     image.save(f"{filename}.png")
     with open(f"{filename}.txt", "w") as f:
         f.write(settings)
-    # Hand this generation's scratch memory back to the OS so RSS between
-    # images stays near the model's size.
-    del images, kwargs
-    _trim_host_memory()
+    # The decorator then hands this generation's scratch memory back to the
+    # OS (also when it fails), so RSS between images stays near the model's size.
     return GenerationResult(
         image=image,
         path=os.path.abspath(f"{filename}.png"),

@@ -27,7 +27,7 @@ FLUX.2 [klein] works like an image editor in img2img and inpainting: it uses the
 
 - Z-Image Turbo needs a 16GB GPU (with CPU offload, ~12GB peak), FLUX.2 [klein] 4B ~8GB with CPU offload, and the XL models run on 8GB.
 - Make sure you have the Nvidia drivers and all that.
-- The newer models are bigger. On a 16GB GPU (RTX 4070 Ti SUPER), Z-Image Turbo and FLUX.2 [klein] both need CPU offload, which the app turns on automatically for them on GPUs with less than 24GB; it brings peak GPU memory down to roughly 12GB for Z-Image Turbo and 8GB for FLUX.2 [klein] 4B. You also need plenty of system RAM for the offloaded parts (32GB+): with CPU offload the whole model lives in host RAM (~20GB for Z-Image Turbo). Switching mode (txt2img, img2img, inpaint) on the same model reuses the loaded model; switching model unloads it first, and on Linux the freed memory is returned to the OS. Memory is also trimmed after each image, so RSS between images stays near the model's size. The XL models run without offload on 16GB.
+- The newer models are bigger. On a 16GB GPU (RTX 4070 Ti SUPER), Z-Image Turbo and FLUX.2 [klein] both need CPU offload, which the app turns on automatically for them on GPUs with less than 24GB; it brings peak GPU memory down to roughly 12GB for Z-Image Turbo and 8GB for FLUX.2 [klein] 4B. You also need plenty of system RAM for the offloaded parts (32GB+): with CPU offload the whole model lives in host RAM (~20GB for Z-Image Turbo). Switching mode (txt2img, img2img, inpaint) on the same model reuses the loaded model; switching model unloads it first. Unloading (the sidebar button, or a model switch) returns the memory to the OS on Linux. Memory is also trimmed after each image, so RSS between images stays near the model's size. The XL models run without offload on 16GB.
 - Disk: Z-Image Turbo is roughly 33GB and FLUX.2 [klein] 4B roughly 16GB.
 
 Observations based on my own machine:
@@ -75,7 +75,7 @@ Each tab has an optional seed input. Leave it empty for a random seed; the seed 
 
 ### Out of memory errors
 
-Out of memory errors occur frequently in my setup (8GB GPU), even though I've tried to limit the usage of cache and clean up the CUDA. They are quickly fixed with the "Unload model" button in the sidebar, which frees the GPU memory (the model is loaded again on the next generate). Streamlit's "Clear cache" no longer unloads the model, so use that button instead.
+Out of memory errors occur frequently in my setup (8GB GPU), even though I've tried to limit the usage of cache and clean up the CUDA. They are quickly fixed with the "Unload model" button in the sidebar, which frees the GPU memory and system RAM (the model is loaded again on the next generate). Streamlit's "Clear cache" no longer unloads the model, so use that button instead.
 
 ## MCP server
 

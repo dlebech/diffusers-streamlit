@@ -88,6 +88,15 @@ def test_generate_trims_host_memory(fake_pipe, tmp_path, monkeypatch):
     assert trims == [1]
 
 
+def test_generate_trims_host_memory_when_it_fails(fake_pipe, tmp_path, monkeypatch):
+    trims = []
+    monkeypatch.setattr(gen, "_trim_host_memory", lambda: trims.append(1))
+    fake_pipe.fail = RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"):
+        run(tmp_path)
+    assert trims == [1]
+
+
 def test_cpu_offload_depends_on_gpu_memory(monkeypatch):
     monkeypatch.setattr(gen, "gpu_memory_bytes", lambda: 16 * 2**30)
     assert gen.needs_cpu_offload(gen.Z_IMAGE_TURBO)
@@ -235,7 +244,52 @@ def test_failed_mode_switch_leaves_nothing_loaded(fake_loader, monkeypatch):
     assert gen._loaded is None
 
 
-def test_unload_trims_host_memory(monkeypatch):
+@pytest.mark.parametrize("step", ["from_pipe", "enable_model_cpu_offload"])
+def test_failed_mode_switch_frees_the_old_pipeline(fake_loader, monkeypatch, step):
+    events = fake_loader
+    old = weakref.ref(gen.get_pipeline("txt2img", gen.Z_IMAGE_TURBO, True))
+    inpaint = gen.PIPELINES[("inpaint", gen.Z_IMAGE_TURBO)][0]
+    real_from_pipe = inpaint.from_pipe
+
+    def broken_from_pipe(pipeline, **kwargs):
+        raise RuntimeError("boom")  # The traceback holds this frame, and so `pipeline`.
+
+    def broken_offload(self):
+        raise RuntimeError("boom")
+
+    if step == "from_pipe":
+        monkeypatch.setattr(inpaint, "from_pipe", broken_from_pipe)
+    else:
+        monkeypatch.setattr(inpaint, "from_pipe", real_from_pipe)
+        monkeypatch.setattr(inpaint, "enable_model_cpu_offload", broken_offload)
+    real_unload = gen.unload_pipeline
+
+    def unload():
+        # Before gc: only plain references would keep the old pipeline alive.
+        events.append(("unload", old() is None))
+        real_unload()
+
+    monkeypatch.setattr(gen, "unload_pipeline", unload)
+    events.clear()
+    with pytest.raises(RuntimeError, match="boom") as info:
+        gen.get_pipeline("inpaint", gen.Z_IMAGE_TURBO, True)
+    assert gen._loaded is None
+    # Unloaded (gc, CUDA cache, trim) after the old pipeline lost its references.
+    assert ("unload", True) in events and events[-1] == ("trim",)
+    assert ("unload", False) not in events
+    # The traceback still says where it failed.
+    assert info.traceback[-1].name in ("broken_from_pipe", "broken_offload")
+
+
+@pytest.fixture
+def fresh_malloc_trim():
+    """Makes _trim_host_memory() look up malloc_trim again, before and after the test."""
+    gen._malloc_trim.cache_clear()
+    yield
+    gen._malloc_trim.cache_clear()
+
+
+def test_unload_trims_host_memory(monkeypatch, fresh_malloc_trim):
     trims = []
 
     class Libc:
@@ -247,7 +301,22 @@ def test_unload_trims_host_memory(monkeypatch):
     assert trims == [0]
 
 
-def test_missing_malloc_trim_is_harmless(monkeypatch):
+def test_malloc_trim_is_looked_up_once(monkeypatch, fresh_malloc_trim):
+    lookups, trims = [], []
+
+    class Libc:
+        def malloc_trim(self, pad):
+            trims.append(pad)
+
+    monkeypatch.setattr(gen.ctypes.util, "find_library", lambda name: lookups.append(name) or "libc.so.6")
+    monkeypatch.setattr(gen.ctypes, "CDLL", lambda name: lookups.append(name) or Libc())
+    for _ in range(3):
+        gen._trim_host_memory()
+    assert lookups == ["c", "libc.so.6"]
+    assert trims == [0, 0, 0]
+
+
+def test_missing_malloc_trim_is_harmless(monkeypatch, fresh_malloc_trim):
     names = []
 
     def libc_without_malloc_trim(name):
@@ -264,6 +333,7 @@ def test_missing_malloc_trim_is_harmless(monkeypatch):
         raise OSError("no libc")
 
     # No libc to be found (e.g. Windows): falls back to libc.so.6, which fails.
+    gen._malloc_trim.cache_clear()
     monkeypatch.setattr(gen.ctypes, "CDLL", no_libc)
     monkeypatch.setattr(gen.ctypes.util, "find_library", lambda name: None)
     gen.unload_pipeline()
