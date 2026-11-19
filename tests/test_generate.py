@@ -81,6 +81,13 @@ def test_output_files_saved(fake_pipe, tmp_path):
     assert result.image.size == (64, 64)
 
 
+def test_generate_trims_host_memory(fake_pipe, tmp_path, monkeypatch):
+    trims = []
+    monkeypatch.setattr(gen, "_trim_host_memory", lambda: trims.append(1))
+    run(tmp_path)
+    assert trims == [1]
+
+
 def test_cpu_offload_depends_on_gpu_memory(monkeypatch):
     monkeypatch.setattr(gen, "gpu_memory_bytes", lambda: 16 * 2**30)
     assert gen.needs_cpu_offload(gen.Z_IMAGE_TURBO)

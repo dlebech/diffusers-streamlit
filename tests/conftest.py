@@ -100,6 +100,7 @@ def fake_pipe(monkeypatch, tmp_path):
 
     monkeypatch.setattr(gen, "get_pipeline", fake_get_pipeline)
     monkeypatch.setattr(gen, "gpu_memory_bytes", lambda: 16 * 2**30)
+    monkeypatch.setattr(gen, "_trim_host_memory", lambda: None)
     monkeypatch.setattr(mcp_server, "OUTPUT_DIR", str(tmp_path / "outputs"))
     monkeypatch.setattr(mcp_server, "_lock", asyncio.Lock())
     pipe.loads = loads

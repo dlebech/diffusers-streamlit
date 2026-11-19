@@ -362,6 +362,10 @@ def generate(
     image.save(f"{filename}.png")
     with open(f"{filename}.txt", "w") as f:
         f.write(settings)
+    # Hand this generation's scratch memory back to the OS so RSS between
+    # images stays near the model's size.
+    del images, kwargs
+    _trim_host_memory()
     return GenerationResult(
         image=image,
         path=os.path.abspath(f"{filename}.png"),
