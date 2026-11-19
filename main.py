@@ -278,7 +278,7 @@ def main():
         img2img_tab()
 
     with st.sidebar:
-        if st.button("Unload model (frees GPU memory)"):
+        if st.button("Unload model (frees GPU and system memory)"):
             unload_pipeline()
             st.toast("Model unloaded")
         st.header("Latest Output Image")

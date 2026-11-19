@@ -83,7 +83,7 @@ def test_invalid_seed_shows_error_and_does_not_generate(fakes, seed):
 
 def test_unload_button_calls_unload_pipeline(fakes):
     at = run_app()
-    button(at, "Unload model (frees GPU memory)").click()
+    button(at, "Unload model (frees GPU and system memory)").click()
     at.run()
     assert not at.exception
     assert fakes.unload == 1
